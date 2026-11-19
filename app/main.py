@@ -6,13 +6,25 @@ import os
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Path, Request
 from fastapi.responses import JSONResponse
 
 from . import __version__
-from .database import Database, RevisionConflict
+from .database import (
+    CorrectionLimitExceeded,
+    CorrectionRebuildFailed,
+    Database,
+    NoMatchingRelations,
+    RevisionConflict,
+)
 from .geometry import GeometryError, build_polygon_geojson
-from .models import RevisionIn, RevisionResult
+from .models import (
+    CorrectionItem,
+    CorrectionResult,
+    NodeCorrectionIn,
+    RevisionIn,
+    RevisionResult,
+)
 
 def _database_path() -> str:
     # Read lazily so tests (and redeployed env) can override FLOOD_DB_PATH.
@@ -110,6 +122,84 @@ def upload_revision(relation_id: int, payload: RevisionIn, request: Request) -> 
         geometry=geometry,
         error=error,
         last_valid_revision=last_valid["revision"] if last_valid else None,
+    )
+
+
+@app.post(
+    "/nodes/{node_id}/corrections",
+    response_model=CorrectionResult,
+    status_code=200,
+    tags=["corrections"],
+    summary="Correct one shared node across every relation currently using it",
+)
+def correct_node(
+    node_id: int = Path(..., ge=1, description="OSM node id to correct"),
+    payload: NodeCorrectionIn = ...,
+    request: Request = ...,
+) -> CorrectionResult:
+    """Apply a node coordinate correction as one atomic batch.
+
+    Every currently served relation (its latest revision is valid) whose
+    ways reference ``node_id`` is located — at most eight. For each one
+    the latest *raw* snapshot is copied, the node coordinates are
+    replaced and the Polygon rebuilt. Relations whose node already has
+    exactly the submitted coordinates return unchanged (no new revision);
+    the others each get one strictly increasing revision.
+
+    The whole batch commits in a single transaction, so concurrent
+    uploads cannot interleave with it and readers never observe a
+    partially corrected layer. No matching relation (404), exceeding the
+    eight-relation cap (422) or any rebuild failure (422) roll the batch
+    back completely: the current supply and all historical revisions stay
+    exactly as they were.
+    """
+    db = _db(request)
+
+    def rebuild(raw_payload: dict) -> dict:
+        # Validates the corrected snapshot exactly like a normal upload.
+        return build_polygon_geojson(RevisionIn(**raw_payload))
+
+    try:
+        items = db.correct_node(
+            node_id=node_id, lat=payload.lat, lon=payload.lon, rebuild=rebuild
+        )
+    except NoMatchingRelations as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "no_matching_relations",
+                "message": str(exc),
+                "node_id": exc.node_id,
+            },
+        ) from exc
+    except CorrectionLimitExceeded as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "correction_limit_exceeded",
+                "message": str(exc),
+                "node_id": exc.node_id,
+                "matching_relations": exc.count,
+                "limit": exc.limit,
+            },
+        ) from exc
+    except CorrectionRebuildFailed as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "rebuild_failed",
+                "message": str(exc),
+                "node_id": node_id,
+                "relation_id": exc.relation_id,
+                "geometry_error": exc.detail,
+            },
+        ) from exc
+
+    return CorrectionResult(
+        node_id=node_id,
+        lat=payload.lat,
+        lon=payload.lon,
+        corrections=[CorrectionItem(**item) for item in items],
     )
 
 
